@@ -268,6 +268,13 @@
     const TOTAL_2 = 291;
     const TOTAL_FRAMES = TOTAL_1 + TOTAL_2;
 
+    // Detecção precisa de mobile
+    const isMobile = window.innerWidth <= 768 || ('ontouchstart' in window);
+
+    // Em mobile, pular frames para rolagem hiper leve e sem gargalo de decodificação:
+    // Passo 2 = 295 frames totais (metade da carga de decodificação/memória, mantendo fluidez impecável)
+    const FRAME_STEP = isMobile ? 2 : 1;
+
     function getFrameSrc(index) {
       if (index < TOTAL_1) {
         const num = String(index + 1).padStart(3, '0');
@@ -279,39 +286,55 @@
     }
 
     const canvas = document.getElementById('stage');
-    const ctx = canvas.getContext('2d', { alpha: false });
+    const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 
     const images = new Array(TOTAL_FRAMES);
     const loaded = new Array(TOTAL_FRAMES).fill(false);
 
-    // Detecção de modo de performance (Mobile / Baixo consumo de memória e bateria)
-    const isMobile = window.innerWidth <= 768 || ('ontouchstart' in window);
-    const PRELOAD_BEHIND = isMobile ? 4 : 8;
-    const PRELOAD_AHEAD = isMobile ? 10 : 16;
+    // Cache limitado em mobile (LRU ring buffer) para evitar pressão de Garbage Collection do navegador
+    const MAX_CACHE = isMobile ? 40 : TOTAL_FRAMES;
+    const loadedIndices = [];
+
+    const PRELOAD_BEHIND = isMobile ? 2 : 8;
+    const PRELOAD_AHEAD = isMobile ? 4 : 16;
 
     function resizeCanvas() {
-      // Em mobile, dpr = 1.0 a 1.5 é o sweet spot perfeito para 60fps sem consumo excessivo de memória/bateria
-      const maxDpr = isMobile ? (window.innerWidth <= 480 ? 1.25 : 1.5) : 2.0;
-      const dpr = Math.min(window.devicePixelRatio || 1, maxDpr);
+      // 1.0 dpr em mobile para 60fps constantes sem sobrecarregar a GPU
+      const dpr = isMobile ? 1.0 : Math.min(window.devicePixelRatio || 1, 2.0);
       canvas.width = Math.round(window.innerWidth * dpr);
       canvas.height = Math.round(window.innerHeight * dpr);
       ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = isMobile ? 'medium' : 'high';
+      ctx.imageSmoothingQuality = 'medium';
       renderFrame(Math.round(currentFrameProgress));
     }
     window.addEventListener('resize', resizeCanvas, { passive: true });
     window.addEventListener('orientationchange', () => {
-      setTimeout(resizeCanvas, 100);
+      setTimeout(resizeCanvas, 80);
     }, { passive: true });
 
-    function loadFrame(index) {
-      if (index < 0 || index >= TOTAL_FRAMES) return;
+    function loadFrame(rawIndex) {
+      if (rawIndex < 0 || rawIndex >= TOTAL_FRAMES) return;
+      // Normaliza para o passo atual
+      const index = Math.round(rawIndex / FRAME_STEP) * FRAME_STEP;
+      if (index >= TOTAL_FRAMES) return;
+
       if (!images[index]) {
         const img = new Image();
+        img.decoding = 'async';
         img.src = getFrameSrc(index);
         img.onload = () => {
           loaded[index] = true;
-          if (Math.round(currentFrameProgress) === index) {
+          if (isMobile) {
+            loadedIndices.push(index);
+            if (loadedIndices.length > MAX_CACHE) {
+              const oldIndex = loadedIndices.shift();
+              if (Math.abs(oldIndex - currentFrameProgress) > 12) {
+                images[oldIndex] = null;
+                loaded[oldIndex] = false;
+              }
+            }
+          }
+          if (Math.round(currentFrameProgress / FRAME_STEP) * FRAME_STEP === index) {
             drawToCanvas(img);
           }
         };
@@ -338,18 +361,19 @@
     }
 
     let lastRenderedIndex = -1;
-    function renderFrame(index) {
-      const clamped = Math.max(0, Math.min(TOTAL_FRAMES - 1, index));
-      loadFrame(clamped);
+    function renderFrame(rawIndex) {
+      const clamped = Math.max(0, Math.min(TOTAL_FRAMES - 1, rawIndex));
+      const targetIndex = Math.round(clamped / FRAME_STEP) * FRAME_STEP;
+      loadFrame(targetIndex);
 
-      // Preload adaptativo
+      // Preload adaptativo em passos
       for (let offset = -PRELOAD_BEHIND; offset <= PRELOAD_AHEAD; offset++) {
-        loadFrame(clamped + offset);
+        loadFrame(targetIndex + offset * FRAME_STEP);
       }
 
-      if (images[clamped] && loaded[clamped]) {
-        drawToCanvas(images[clamped]);
-        lastRenderedIndex = clamped;
+      if (images[targetIndex] && loaded[targetIndex]) {
+        drawToCanvas(images[targetIndex]);
+        lastRenderedIndex = targetIndex;
       } else if (lastRenderedIndex !== -1 && images[lastRenderedIndex] && loaded[lastRenderedIndex]) {
         drawToCanvas(images[lastRenderedIndex]);
       }
@@ -430,6 +454,10 @@
       }
     }
 
+    // Cache dos valores de estilo anteriores para evitar layout thrashing / recalculo desnecessário de DOM
+    let prevActiveTracker = -1;
+    let prevHeaderClass = '';
+
     function updateScrollLogic() {
       const scrollY = window.pageYOffset || document.documentElement.scrollTop;
       const heroRect = heroSection.getBoundingClientRect();
@@ -446,9 +474,14 @@
 
       targetProgress = heroProgress * (TOTAL_FRAMES - 1);
 
+      // Em mobile com swipe rápido, atualizar diretamente se a inércia for muito rápida
+      if (isMobile && Math.abs(targetProgress - currentFrameProgress) > 30) {
+        currentFrameProgress += (targetProgress - currentFrameProgress) * 0.35;
+      }
+
       // Atualiza barra de progresso mobile
       if (heroProgressBar) {
-        heroProgressBar.style.width = `${heroProgress * 100}%`;
+        heroProgressBar.style.width = `${Math.round(heroProgress * 100)}%`;
       }
 
       // Se passou da hero, oculta a camada de narrativa para nunca cobrir outras seções
@@ -465,7 +498,7 @@
         heroScrollCue.style.opacity = Math.max(0, 1 - heroProgress * 12);
       }
 
-      // ATUALIZAÇÃO REFINADA DOS CAPÍTULOS NARRATIVOS
+      // ATUALIZAÇÃO REFINADA DOS CAPÍTULOS NARRATIVOS (Sem interpolação pesada repetida)
       const isMobileView = window.innerWidth <= 640;
       CHAPTERS_CONFIG.forEach((ch) => {
         if (!ch.element) return;
@@ -474,67 +507,61 @@
         let translateY = 0;
 
         if (heroProgress >= ch.start && heroProgress <= ch.end) {
-          // Fase Fade In
           if (heroProgress < ch.fadeIn) {
             const range = ch.fadeIn - ch.start;
             const factor = range > 0 ? (heroProgress - ch.start) / range : 1;
             opacity = factor;
-            translateY = (1 - factor) * 16;
-          }
-          // Visibilidade Plena
-          else if (heroProgress >= ch.fadeIn && heroProgress <= ch.fadeOut) {
+            translateY = (1 - factor) * 12;
+          } else if (heroProgress >= ch.fadeIn && heroProgress <= ch.fadeOut) {
             opacity = 1;
             translateY = 0;
-          }
-          // Fase Fade Out
-          else {
+          } else {
             const range = ch.end - ch.fadeOut;
             const factor = range > 0 ? (heroProgress - ch.fadeOut) / range : 1;
             opacity = Math.max(0, 1 - factor);
-            translateY = -factor * 16;
+            translateY = -factor * 12;
           }
         } else {
           opacity = 0;
-          translateY = heroProgress < ch.start ? 16 : -16;
+          translateY = heroProgress < ch.start ? 12 : -12;
         }
 
-        // Aplicação de estilos precisa
-        ch.element.style.opacity = opacity;
-        ch.element.style.pointerEvents = opacity > 0.4 ? 'auto' : 'none';
+        const opacityFixed = opacity.toFixed(2);
+        if (ch.element._lastOpacity !== opacityFixed) {
+          ch.element._lastOpacity = opacityFixed;
+          ch.element.style.opacity = opacityFixed;
+          ch.element.style.pointerEvents = opacity > 0.4 ? 'auto' : 'none';
 
-        // Em mobile preserva o posicionamento na base da tela
-        if (isMobileView) {
-          ch.element.style.transform = `translateY(${translateY}px)`;
-        } else {
-          // Em desktop mantém centrado verticalmente ou com offset
-          if (ch.id === 'chapter-04' || ch.id === 'chapter-06') {
-            ch.element.style.transform = `translate(-50%, calc(-50% + ${translateY}px))`;
+          if (isMobileView) {
+            ch.element.style.transform = `translateY(${Math.round(translateY)}px)`;
           } else {
-            ch.element.style.transform = `translateY(calc(-50% + ${translateY}px))`;
+            if (ch.id === 'chapter-04' || ch.id === 'chapter-06') {
+              ch.element.style.transform = `translate(-50%, calc(-50% + ${Math.round(translateY)}px))`;
+            } else {
+              ch.element.style.transform = `translateY(calc(-50% + ${Math.round(translateY)}px))`;
+            }
           }
         }
       });
 
-      // ATUALIZAÇÃO DO TRACKER VERTICAL LATERAL (01 A 05)
-      // 01 O Empreendimento (~0-18%)
-      // 02 A Arquitetura (~18-42%)
-      // 03 A Varanda (~42-62%)
-      // 04 Os Interiores (~62-84%)
-      // 05 O Próximo Passo (~84-100%)
+      // ATUALIZAÇÃO DO TRACKER VERTICAL LATERAL (01 A 05) - apenas quando muda de etapa
       let activeTracker = 1;
       if (heroProgress >= 0.84) activeTracker = 5;
       else if (heroProgress >= 0.62) activeTracker = 4;
       else if (heroProgress >= 0.42) activeTracker = 3;
       else if (heroProgress >= 0.18) activeTracker = 2;
 
-      trackerItems.forEach((item) => {
-        const step = parseInt(item.getAttribute('data-chapter'), 10);
-        if (step === activeTracker) {
-          item.classList.add('active');
-        } else {
-          item.classList.remove('active');
-        }
-      });
+      if (activeTracker !== prevActiveTracker) {
+        prevActiveTracker = activeTracker;
+        trackerItems.forEach((item) => {
+          const step = parseInt(item.getAttribute('data-chapter'), 10);
+          if (step === activeTracker) {
+            item.classList.add('active');
+          } else {
+            item.classList.remove('active');
+          }
+        });
+      }
 
       // Adaptação das cores do Header conforme a seção de fundo
       const curadoriaEl = document.getElementById('curadoria');
@@ -543,13 +570,17 @@
       if (curadoriaEl && conversaoEl) {
         const curadoriaTop = curadoriaEl.getBoundingClientRect().top;
         const conversaoTop = conversaoEl.getBoundingClientRect().top;
+        let newHeaderClass = 'site-header';
 
         if (conversaoTop <= 60) {
-          mainHeader.className = 'site-header scrolled-dark';
+          newHeaderClass = 'site-header scrolled-dark';
         } else if (curadoriaTop <= 60) {
-          mainHeader.className = 'site-header scrolled-light';
-        } else {
-          mainHeader.className = 'site-header';
+          newHeaderClass = 'site-header scrolled-light';
+        }
+
+        if (newHeaderClass !== prevHeaderClass) {
+          prevHeaderClass = newHeaderClass;
+          mainHeader.className = newHeaderClass;
         }
       }
     }
@@ -558,9 +589,14 @@
 
     function tick() {
       const diff = targetProgress - currentFrameProgress;
-      // Coeficiente LERP ligeiramente mais ágil no mobile para acompanhar o swipe touch com precisão
-      const lerpSpeed = isMobile ? 0.16 : 0.12;
+      // Coeficiente LERP dinâmico e responsivo
+      const lerpSpeed = isMobile ? 0.22 : 0.12;
       currentFrameProgress += diff * lerpSpeed;
+
+      // Se a diferença for insignificante, ancora para poupar renderização desnecessária
+      if (Math.abs(diff) < 0.15) {
+        currentFrameProgress = targetProgress;
+      }
 
       renderFrame(Math.round(currentFrameProgress));
       requestAnimationFrame(tick);
